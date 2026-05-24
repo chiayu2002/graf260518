@@ -30,12 +30,9 @@ class _ResidualBlock(nn.Module):
 # ================================================================
 class SRNetwork(nn.Module):
     """
-    Lightweight super-resolution network with global residual.
+    Lightweight super-resolution network.
     Input:  [B, 3, 64, 64]   (NeRF output, range [-1, 1])
     Output: [B, 3, 256, 256] (upscaled, clamped to [-1, 1])
-
-    Global residual: SR only learns the high-freq detail on top of
-    a bilinear 4× upsample of the input.
     """
 
     def __init__(self, ch=64, n_rb=6):
@@ -52,12 +49,10 @@ class SRNetwork(nn.Module):
         self.tail = nn.Conv2d(ch, 3, 3, 1, 1)
 
     def forward(self, x):
-        # Global residual: SR only needs to learn the difference
-        upsampled = F.interpolate(x, scale_factor=4, mode='bilinear', align_corners=True)
         h = self.head(x)
         h = self.body(h) + h
         h = self.up(h)
-        return torch.clamp(self.tail(h) + upsampled, -1, 1)
+        return torch.clamp(self.tail(h), -1, 1)
 
 
 # ================================================================

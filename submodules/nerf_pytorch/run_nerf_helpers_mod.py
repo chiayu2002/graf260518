@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from functools import partial
+from condition_bottleneck import ConditionBottleneck
 
 
 
@@ -93,7 +94,7 @@ class NeRF(nn.Module):
         # ========================================================
 
         # 共享給 D 用 — 1024 → W (=256)
-        self.condition_feature = nn.Linear(1024, W)
+        self.condition_feature = ConditionBottleneck(1024, W, bottleneck_dim=16)
 
         if use_viewdirs:
             self.feature_linear = nn.Linear(W, W)

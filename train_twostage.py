@@ -15,9 +15,9 @@ Phase 2 (iter phase2_start ~):
   - Multi-scale discriminator (D_low + D_high)
 
 [INTERP] Conditioning Interpolation Regularization:
-  - Bottleneck: condition_feature now uses 1024→16→256
-  - During G step, randomly interpolate bottleneck embeddings
-    between specimen pairs with Beta(0.2, 0.2) mixing
+  - Bottleneck: condition_feature uses 1024→16→256
+  - During G step, interpolate in 16-dim bottleneck space
+  - Use set_override() to inject pre-decoded conditioning into generator
   - Only G adversarial loss on interpolated samples (Strategy 2)
   - D never sees interpolated samples
 
@@ -25,8 +25,10 @@ Performance Optimizations:
   - Pre-computed full-image rays cached per (angle, height) pair
   - x_real_64 computed once per iteration
   - Discriminator forward consolidated (single forward for real/fake aux)
-  - torch.no_grad() scopes minimized
-  - Reduced redundant .to(device) calls
+  - [OPT] Pre-allocated zero tensor reused across iterations
+  - [OPT] Beta distribution created once outside training loop
+  - [OPT] Vectorized interpolation sampling (no Python loop)
+  - [OPT] Interp specimen tensors pre-stacked to avoid per-iter allocation
 """
 import argparse, os, importlib, json, glob, time, random, sys
 import numpy as np
@@ -105,7 +107,7 @@ def initialize_training(config, device):
 
 
 # ================================================================
-# Ray Cache — avoid recomputing full-image rays every iteration
+# Ray Cache
 # ================================================================
 class RayCache:
     def __init__(self, generator, v_list, focal_64):
@@ -138,66 +140,74 @@ class RayCache:
 # ================================================================
 # [INTERP] Interpolation utilities
 # ================================================================
-def build_interp_cache(cached_hs, specimen_specs, cond_bottleneck, device):
+class InterpCache:
     """
-    Pre-compute bottleneck embeddings and material features for each
-    training specimen. Returns a list of dicts for interpolation sampling.
+    Pre-computed interpolation data. Stores specimen bottleneck embeddings,
+    material features, label vectors, and hidden states as stacked tensors
+    for efficient vectorized sampling.
+
+    [OPT] Stacking once avoids per-iteration torch.tensor() and dict lookups.
     """
-    interp_data = []
-    with torch.no_grad():
-        for sn, (vec, mf) in specimen_specs.items():
-            if sn not in cached_hs:
-                continue
-            hs = cached_hs[sn]
-            b = cond_bottleneck.encode(hs.unsqueeze(0))
-            m = torch.tensor(mf, dtype=torch.float32, device=device)
-            v = torch.tensor(vec, dtype=torch.float32, device=device)
-            interp_data.append({
-                'name': sn,
-                'bottleneck': b.squeeze(0),   # [16]
-                'mat_feat': m,                # [7]
-                'label_vec': v,               # [7]
-                'hidden_state': hs,           # [1024]
-            })
-    return interp_data
 
+    def __init__(self, cached_hs, specimen_specs, cond_bottleneck, device):
+        self.names = []
+        bneck_list, mat_list, vec_list, hs_list = [], [], [], []
 
-def sample_interpolated_conditioning(interp_data, n_interp, device):
-    """
-    Generate n_interp interpolated conditioning samples.
-    Uses Beta(0.2, 0.2) for mixing — U-shaped, mostly near 0 or 1,
-    occasionally in the middle.
+        with torch.no_grad():
+            for sn, (vec, mf) in specimen_specs.items():
+                if sn not in cached_hs:
+                    continue
+                hs = cached_hs[sn]
+                b = cond_bottleneck.encode(hs.unsqueeze(0)).squeeze(0)
+                self.names.append(sn)
+                bneck_list.append(b)
+                mat_list.append(torch.tensor(mf, dtype=torch.float32, device=device))
+                vec_list.append(torch.tensor(vec, dtype=torch.float32, device=device))
+                hs_list.append(hs)
 
-    Returns tuple: (bottleneck, mat, label, hidden_state) tensors,
-    or (None, None, None, None) if < 2 specimens.
-    """
-    n_specimens = len(interp_data)
-    if n_specimens < 2:
-        return None, None, None, None
+        self.n = len(self.names)
+        if self.n > 0:
+            self.bottlenecks = torch.stack(bneck_list)   # [N_spec, 16]
+            self.mat_feats = torch.stack(mat_list)       # [N_spec, 7]
+            self.label_vecs = torch.stack(vec_list)      # [N_spec, 7]
+            self.hidden_states = torch.stack(hs_list)    # [N_spec, 1024]
 
-    beta_dist = torch.distributions.Beta(0.2, 0.2)
-    bottlenecks, mats, labels, hss = [], [], [], []
+    def sample(self, n_interp, beta_dist, device):
+        """
+        Vectorized interpolation sampling. No Python loop.
 
-    for _ in range(n_interp):
-        idx_a, idx_b = random.sample(range(n_specimens), 2)
-        a, b = interp_data[idx_a], interp_data[idx_b]
-        lam = beta_dist.sample().item()
+        Returns:
+            i_bneck:  [n_interp, 16]   — interpolated bottleneck embeddings
+            i_label:  [n_interp, 16]   — interpolated full label
+            i_hs:     [n_interp, 1024] — interpolated hidden states
+        Or (None, None, None) if < 2 specimens.
+        """
+        if self.n < 2:
+            return None, None, None
 
-        bottlenecks.append(lam * a['bottleneck'] + (1 - lam) * b['bottleneck'])
-        mats.append(lam * a['mat_feat'] + (1 - lam) * b['mat_feat'])
-        hss.append(lam * a['hidden_state'] + (1 - lam) * b['hidden_state'])
+        # [OPT] Vectorized pair selection + mixing
+        idx_a = torch.randint(0, self.n, (n_interp,), device=device)
+        idx_b = torch.randint(0, self.n - 1, (n_interp,), device=device)
+        idx_b = idx_b + (idx_b >= idx_a).long()  # ensure idx_b != idx_a
 
-        v_interp = lam * a['label_vec'] + (1 - lam) * b['label_vec']
-        m_interp = mats[-1]
-        h_idx = random.randint(0, 3)
-        a_idx = random.randint(0, 359)
-        label_interp = torch.cat([v_interp, m_interp,
-                                  torch.tensor([h_idx, a_idx], device=device,
-                                               dtype=torch.float32)])
-        labels.append(label_interp)
+        lam = beta_dist.sample((n_interp,)).to(device).unsqueeze(-1)  # [n_interp, 1]
 
-    return (torch.stack(bottlenecks), torch.stack(mats),
-            torch.stack(labels), torch.stack(hss))
+        b_a, b_b = self.bottlenecks[idx_a], self.bottlenecks[idx_b]
+        m_a, m_b = self.mat_feats[idx_a], self.mat_feats[idx_b]
+        v_a, v_b = self.label_vecs[idx_a], self.label_vecs[idx_b]
+        h_a, h_b = self.hidden_states[idx_a], self.hidden_states[idx_b]
+
+        i_bneck = lam * b_a + (1 - lam) * b_b
+        i_mat = lam * m_a + (1 - lam) * m_b
+        i_vec = lam * v_a + (1 - lam) * v_b
+        i_hs = lam * h_a + (1 - lam) * h_b
+
+        # Build label: [vec(7), mat(7), h_idx(1), a_idx(1)]
+        h_idx = torch.randint(0, 4, (n_interp, 1), device=device, dtype=torch.float32)
+        a_idx = torch.randint(0, 360, (n_interp, 1), device=device, dtype=torch.float32)
+        i_label = torch.cat([i_vec, i_mat, h_idx, a_idx], dim=-1)
+
+        return i_bneck, i_label, i_hs
 
 
 # ================================================================
@@ -240,7 +250,7 @@ def main():
     use_recon       = recon_config.get('enabled', False)
     lambda_recon    = recon_config.get('lambda_recon', 0.1)
 
-    # [INTERP] Interpolation config — can be set in YAML or use defaults
+    # [INTERP] config
     interp_config  = config.get('interpolation', {})
     use_interp     = interp_config.get('enabled', True)
     n_interp       = interp_config.get('n_samples', 2)
@@ -280,7 +290,7 @@ def main():
     print(f"[SR] {sum(p.numel() for p in sr_network.parameters()):,} params")
     print(f"[D_high] {sum(p.numel() for p in d_high.parameters()):,} params")
 
-    # [INTERP] Verify bottleneck is present
+    # [INTERP] Verify bottleneck
     if hasattr(shared_cond_proj, 'bottleneck_dim'):
         print(f"[Bottleneck] {shared_cond_proj.hidden_dim} "
               f"→ {shared_cond_proj.bottleneck_dim} → {shared_cond_proj.out_dim}")
@@ -322,7 +332,42 @@ def main():
             act_cache_file=os.path.join(out_dir, 'kid_cache_train.npz'))
 
     cached_hs = {n: h.to(device) for n, h in train_dataset.hidden_state.items()}
-    print(f"Cached hidden states: {list(cached_hs.keys())}")
+    print(f"\nCached hidden states for: {list(cached_hs.keys())}")
+    print("-" * 70)
+    print(f"{'Comparison':<18} | {'L2 Distance':<12} | {'Cosine Sim':<12} | {'Bneck Cos Sim':<12}")
+    print("-" * 70)
+    
+    hs_keys = list(cached_hs.keys())
+    for i, k1 in enumerate(hs_keys):
+        for k2 in hs_keys[i+1:]:
+            hs1 = cached_hs[k1]
+            hs2 = cached_hs[k2]
+            
+            # 計算 原始 Hidden State 的 L2 與 餘弦相似度
+            diff = (hs1 - hs2).norm().item()
+            cos_sim = F.cosine_similarity(hs1.unsqueeze(0), hs2.unsqueeze(0)).item()
+            
+            # 計算 16-dim 瓶頸空間後的 餘弦相似度
+            bneck_cos_sim = float('nan')
+            if hasattr(shared_cond_proj, 'encode'):
+                with torch.no_grad():
+                    b1 = shared_cond_proj.encode(hs1.unsqueeze(0))
+                    b2 = shared_cond_proj.encode(hs2.unsqueeze(0))
+                    bneck_cos_sim = F.cosine_similarity(b1, b2).item()
+            
+            # 終端機格式化輸出
+            bneck_str = f"{bneck_cos_sim:.4f}" if not np.isnan(bneck_cos_sim) else "N/A"
+            print(f"  {k1:<6} vs {k2:<6} | {diff:<12.4f} | {cos_sim:<12.4f} | {bneck_str:<12}")
+            
+            # ─── 寫入 WandB Summary ───
+            # 使用特定前綴（例如 analysis/）分類，方便在面板檢視
+            prefix = f"analysis/similarity_{k1}_vs_{k2}"
+            wandb.run.summary[f"{prefix}/L2_distance"] = diff
+            wandb.run.summary[f"{prefix}/cosine_similarity"] = cos_sim
+            if not np.isnan(bneck_cos_sim):
+                wandb.run.summary[f"{prefix}/bottleneck_cosine_similarity"] = bneck_cos_sim
+            
+    print("-" * 70 + "\n")
 
     # Ray cache
     v_list = [float(x.strip()) for x in config['data']['v'].split(",")]
@@ -356,21 +401,28 @@ def main():
         else:
             yield
 
-    # Pre-compute specimen info for sampling
+    # Pre-compute specimen info
     specimen_specs = {
-        'RS307': ([1, 0, 1, 0, 0, 0, 1], [0, 0.1906, 0.8342, 0.1, 1, 0.0589, 0.1081]),
-        'RS330': ([1, 0, 0, 0, 1, 1, 0], [0.0088, 1, 1, 1, 0, 1, 1]),
-        'RS615': ([0, 1, 0, 1, 0, 1, 0], [1, 0, 0, 0, 0.5826, 0, 0]),
-        'RS315': ([1, 0, 0, 1, 0, 1, 0], [0.0062, 0.4365, 0.602, 0.6261, 0.0064, 0.6284, 0.653]),
+        'RS307': ([1, 0, 1, 0, 0, 0, 1], [0.000000, 0.156717, 0.918975, 0.339361, 0.498170, 0.310937, 0.360617]),
+        'RS330': ([1, 0, 0, 0, 1, 1, 0], [0.008831, 1.000000, 1.000000, 1.000000, 0.000000, 1.000000, 1.000000]),
+        'RS615': ([0, 1, 0, 1, 0, 1, 0], [1.000000, 0.000000, 0.000000, 0.000000, 1.000000, 0.000000, 0.000000]),
+        'RS315': ([1, 0, 0, 1, 0, 1, 0], [0.006158, 0.411209, 0.538894, 0.725360, 0.017321, 0.727661, 0.751007]),
     }
     sample_angles = [0, 45, 90, 135, 180, 225, 270, 315]
     sample_poses = torch.stack([generator.sample_select_pose(i / 8, 0.5) for i in range(8)])
 
-    # [INTERP] Build initial interpolation cache
+    # [INTERP] Build interpolation cache + Beta distribution (created once)
+    interp_cache = None
+    beta_dist = None
     if use_interp:
-        interp_data = build_interp_cache(cached_hs, specimen_specs, shared_cond_proj, device)
-        print(f"[INTERP] Cached {len(interp_data)} specimens: "
-              f"{[d['name'] for d in interp_data]}")
+        interp_cache = InterpCache(cached_hs, specimen_specs, shared_cond_proj, device)
+        beta_dist = torch.distributions.Beta(
+            torch.tensor(0.2, device=device),
+            torch.tensor(0.2, device=device))
+        print(f"[INTERP] Cached {interp_cache.n} specimens: {interp_cache.names}")
+
+    # [OPT] Pre-allocate reusable zero tensor
+    zero = torch.tensor(0., device=device)
 
     last_reg_lo = 0.0
     last_reg_hi = 0.0
@@ -387,9 +439,9 @@ def main():
                 print(f"\n{'=' * 60}\n[Phase 2] iter {it}: SR + D_high active\n{'=' * 60}")
                 phase2_flag = True
 
-            # [INTERP] Refresh interp cache periodically
+            # [INTERP] Refresh cache periodically (bottleneck weights evolve)
             if use_interp and it >= interp_start and it % 1000 == 0:
-                interp_data = build_interp_cache(
+                interp_cache = InterpCache(
                     cached_hs, specimen_specs, shared_cond_proj, device)
 
             # --- Data prep ---
@@ -428,7 +480,6 @@ def main():
                 last_reg_lo = reg_lo.item()
             else:
                 dloss_real_lo.backward(retain_graph=True)
-                reg_lo = torch.tensor(0., device=device)
 
             aux_mat_loss = aux_loss_weight * aux_loss_real + mat_loss_weight * mat_loss_real
             aux_mat_loss.backward()
@@ -455,7 +506,7 @@ def main():
             # ============================================================
             # D_high step — UNCHANGED
             # ============================================================
-            dloss_real_hi = dloss_fake_hi = reg_hi = torch.tensor(0., device=device)
+            dloss_real_hi = dloss_fake_hi = zero
             if in_p2:
                 toggle_grad(d_high, True)
                 toggle_grad(sr_network, False)
@@ -471,7 +522,7 @@ def main():
                     reg_hi = reg_param * 16 * compute_grad2(dr_hi.float(), xr_dh).mean()
                     last_reg_hi = reg_hi.item()
                 else:
-                    reg_hi = torch.tensor(0., device=device)
+                    reg_hi = zero
 
                 with torch.no_grad():
                     sr256 = sr_network(nerf_img_64)
@@ -518,11 +569,11 @@ def main():
                 g_aux = F.mse_loss(aux_f, hidden_state)
                 mat_loss_f = F.mse_loss(lab_f, mat)
 
-                recon64 = torch.tensor(0., device=device)
+                recon64 = zero
                 if use_recon:
                     recon64 = recon_loss_fn(nerf_g_img, x_real_64)
 
-                g_adv_hi = sr_rec = torch.tensor(0., device=device)
+                g_adv_hi = sr_rec = zero
                 if in_p2:
                     sr_g = sr_network(nerf_g_img)
                     dfh_g = d_high(sr_g, label, hidden_state)
@@ -538,22 +589,35 @@ def main():
 
                 # ====================================================
                 # [INTERP] Interpolation regularization (Strategy 2)
-                # D is frozen → only G adversarial loss on interp samples
+                #
+                # KEY FIX: We interpolate in bottleneck space (16-dim),
+                # then decode to 256-dim, then inject via set_override()
+                # so generator() uses our pre-decoded conditioning
+                # instead of re-encoding the interpolated hidden state.
                 # ====================================================
-                g_interp_loss = torch.tensor(0., device=device)
+                g_interp_loss = zero
                 if (use_interp and it >= interp_start
-                        and hasattr(shared_cond_proj, 'encode')):
-                    interp_result = sample_interpolated_conditioning(
-                        interp_data, n_interp, device)
-                    if interp_result[0] is not None:
-                        i_bneck, i_mat, i_label, i_hs = interp_result
+                        and hasattr(shared_cond_proj, 'set_override')):
+                    interp_result = interp_cache.sample(n_interp, beta_dist, device)
+                    i_bneck, i_label, i_hs = interp_result
 
-                        # Generate with interpolated conditioning
+                    if i_bneck is not None:
+                        # Decode bottleneck → 256 (with gradient to decoder)
+                        i_cond_256 = shared_cond_proj.decode(i_bneck)  # [n_interp, 256]
+
+                        # Inject pre-decoded conditioning into bottleneck
+                        # so generator's internal call to condition_feature()
+                        # returns i_cond_256 instead of re-encoding i_hs
+                        shared_cond_proj.set_override(i_cond_256)
+
                         z_interp = zdist.sample((n_interp,))
                         rays_interp = ray_cache.batch_rays(i_label, n_interp)
                         nerf_interp, _ = generator(
                             z_interp, i_label, i_hs, rays=rays_interp)
                         nerf_interp_img = nerf_flat_to_img(nerf_interp, n_interp)
+
+                        # Safety: clear override in case generator didn't consume it
+                        shared_cond_proj.clear_override()
 
                         # G adversarial loss only — D doesn't train on this
                         d_interp_lo = discriminator(
@@ -606,7 +670,7 @@ def main():
                     "lr/g": lr_g_now,
                     "lr/d": lr_d_now,
                     "training/phase": 2 if in_p2 else 1,
-                    "loss/g_interp": g_interp_loss.item(),  # [INTERP]
+                    "loss/g_interp": g_interp_loss.item(),
                 }
                 if in_p2:
                     log_dict.update({
