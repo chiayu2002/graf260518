@@ -33,7 +33,7 @@ def batchify(fn, chunk):
 def run_network(inputs, viewdirs, fn, hidden_state, embed_fn, embeddirs_fn,
                 features=None, netchunk=1024*64,
                 mat_feat=None):
-    """輸出 rgb and sigma — 不再需要 label"""
+    """輸出 rgb and sigma"""
     inputs_flat = torch.reshape(inputs, [-1, inputs.shape[-1]])
     embedded = embed_fn(inputs_flat)
 
@@ -41,16 +41,16 @@ def run_network(inputs, viewdirs, fn, hidden_state, embed_fn, embeddirs_fn,
     batch_size = hidden_state.shape[0]
     points_per_batch = num_total_points // batch_size
 
-    # 預先投影 1024 → 256 再 expand,省記憶體
+    # 投影 hidden state: 1024 → 256
     hidden_state_projected = fn.condition_feature(hidden_state)
 
-    # ── 新增：concat specimen_onehot 和 mat_feat ──────────────
+    # [MAT_PROJ] 投影 mat_feat: 7 → 64 (在 repeat_interleave 之前做,
+    #            只對 B 個向量投影, 不是 B*N_points 個)
     extra_list = [hidden_state_projected]
-    # if specimen_onehot is not None:
-    #     extra_list.append(specimen_onehot.float())          # [B, 3]
     if mat_feat is not None:
-        extra_list.append(mat_feat.float())                 # [B, 7]
-    hidden_state_enhanced = torch.cat(extra_list, dim=-1)  # [B, 256+3+7=266]
+        mat_feat_projected = fn.mat_feat_proj(mat_feat.float())  # [B, 64]
+        extra_list.append(mat_feat_projected)
+    hidden_state_enhanced = torch.cat(extra_list, dim=-1)  # [B, 256+64=320]
 
     hidden_state_expanded = hidden_state_enhanced.repeat_interleave(
         points_per_batch, dim=0
@@ -72,7 +72,7 @@ def run_network(inputs, viewdirs, fn, hidden_state, embed_fn, embeddirs_fn,
     return outputs
 
 
-def batchify_rays(rays_flat, hidden_state,  mat_feat,chunk=1024*32, **kwargs):
+def batchify_rays(rays_flat, hidden_state, mat_feat, chunk=1024*32, **kwargs):
     all_ret = {}
     features = kwargs.get('features')
     for i in range(0, rays_flat.shape[0], chunk):
@@ -117,10 +117,6 @@ def render(H, W, focal, hidden_state, mat_feat, chunk=1024*32, rays=None, c2w=No
         -1, hidden_state.shape[-1]
     )
 
-    # specimen_onehot = torch.tensor(specimen_onehot, dtype=torch.float32).to(device)
-    # specimen_onehot_per_ray = specimen_onehot.unsqueeze(1).repeat(1, rays_per_img, 1).view(
-    #     -1, specimen_onehot.shape[-1])
-
     mat_feat = torch.tensor(mat_feat, dtype=torch.float32).to(device)
     mat_feat_per_ray = mat_feat.unsqueeze(1).repeat(1, rays_per_img, 1).view(
         -1, mat_feat.shape[-1])
@@ -155,12 +151,14 @@ def create_nerf(args):
     output_ch = 5 if args.N_importance > 0 else 4
     skips = [3]
 
-    # ── 新增：cond_extra_dim = specimen(3) + mat_feat(7) ──
-    cond_extra_dim = getattr(args, 'num_classes', 10)
+    # [MAT_PROJ] mat_proj_dim 控制投影後的維度
+    # 這個值會傳給 NeRF 的 numclasses 和 mat_proj_dim 參數
+    mat_proj_dim = 64
 
     model = NeRF(D=args.netdepth, W=args.netwidth,
                  input_ch=input_ch, output_ch=output_ch, skips=skips,
-                 input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs, numclasses=cond_extra_dim)
+                 input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs,
+                 numclasses=mat_proj_dim, mat_proj_dim=mat_proj_dim)
     grad_vars = list(model.parameters())
     named_params = list(model.named_parameters())
 
@@ -168,21 +166,21 @@ def create_nerf(args):
     if args.N_importance > 0:
         model_fine = NeRF(D=args.netdepth_fine, W=args.netwidth_fine,
                           input_ch=input_ch, output_ch=output_ch, skips=skips,
-                          input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs)
+                          input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs,
+                          numclasses=mat_proj_dim, mat_proj_dim=mat_proj_dim)
         grad_vars += list(model_fine.parameters())
         named_params = list(model_fine.named_parameters())
 
     network_query_fn = lambda inputs, viewdirs, network_fn, hidden_state, features, \
                                mat_feat=None: run_network(
-    inputs, viewdirs, network_fn, hidden_state,
-    features=features,
-    embed_fn=embed_fn,
-    embeddirs_fn=embeddirs_fn,
-    netchunk=args.netchunk,
-    # specimen_onehot=specimen_onehot,
-    mat_feat=mat_feat,
+        inputs, viewdirs, network_fn, hidden_state,
+        features=features,
+        embed_fn=embed_fn,
+        embeddirs_fn=embeddirs_fn,
+        netchunk=args.netchunk,
+        mat_feat=mat_feat,
     )
-#specimen_onehot=None,
+
     render_kwargs_train = {             
         'network_query_fn' : network_query_fn,
         'perturb' : args.perturb,

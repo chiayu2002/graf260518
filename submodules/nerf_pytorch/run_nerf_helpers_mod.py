@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 from functools import partial
 from condition_bottleneck import ConditionBottleneck
+from mat_feat_proj import MaterialFeatureProjector
 
 
 
@@ -72,7 +73,13 @@ def get_embedder(multires, i=0):
 # Model
 class NeRF(nn.Module):
     def __init__(self, D=8, W=256, input_ch=3, input_ch_views=3,
-                 output_ch=4, skips=[4], numclasses=4, use_viewdirs=False, **kwargs):
+                 output_ch=4, skips=[4], numclasses=4, use_viewdirs=False,
+                 mat_proj_dim=64, **kwargs):
+        """
+        numclasses: 投影後的 material feature 維度 (原本是 raw mat_feat 維度).
+                    現在由 mat_feat_proj 投影, 預設 = mat_proj_dim = 64.
+        mat_proj_dim: MaterialFeatureProjector 的輸出維度.
+        """
         super(NeRF, self).__init__()
         self.D = D
         self.W = W
@@ -82,6 +89,7 @@ class NeRF(nn.Module):
         self.use_viewdirs = use_viewdirs
         self.numclasses = numclasses
 
+        # [MAT_PROJ] numclasses 現在代表投影後的維度 (64), 不是原始的 7
         self.pts_linears = nn.ModuleList(
             [nn.Linear(input_ch + W + numclasses, W)] +
             [nn.Linear(W, W) if i not in self.skips
@@ -89,12 +97,11 @@ class NeRF(nn.Module):
         )
         self.views_linears = nn.ModuleList([nn.Linear(input_ch_views + W, W//2)])
 
-        # ========================================================
-        # [移除] condition_embedding 從未被呼叫,刪掉
-        # ========================================================
-
         # 共享給 D 用 — 1024 → W (=256)
         self.condition_feature = ConditionBottleneck(1024, W, bottleneck_dim=16)
+
+        # [MAT_PROJ] Material feature projection: 7 → mat_proj_dim (64)
+        self.mat_feat_proj = MaterialFeatureProjector(mat_dim=7, proj_dim=mat_proj_dim)
 
         if use_viewdirs:
             self.feature_linear = nn.Linear(W, W)
@@ -106,14 +113,14 @@ class NeRF(nn.Module):
     def forward(self, x, hidden_state):
         """
         x: [N_pts, input_ch + W]  (positional encoding + projected features)
-        hidden_state: [N_pts, W]  (已經由 run_network 預先投影)
+        hidden_state: [N_pts, W + numclasses]  (projected hs + projected mat_feat)
         """
         input_pts, input_views = torch.split(
             x, [self.input_ch, self.input_ch_views], dim=-1
         )
         hidden_state = hidden_state.to(input_pts.device)
 
-        # 直接使用已投影的 hidden_state
+        # 直接使用已投影的 hidden_state (包含 mat_feat projection)
         feature_embedding = hidden_state
 
         input_o, input_shape = torch.split(input_pts, [63, 256], dim=-1)
@@ -141,14 +148,9 @@ class NeRF(nn.Module):
 
 # ========================================================
 # [修正2] 移除 get_rays 中的 debug 程式碼
-# 原本每次呼叫都會:
-#   1. rays_d.detach().cpu() → GPU→CPU 複製 256×256×3 tensor，
-#      強制 GPU pipeline 同步等待，嚴重影響效能
-#   2. 計算角度值但結果從未使用（print 被註解掉了）
-# 每個 iteration 呼叫 get_rays 至少 8 次（batch_size=8）
 # ========================================================
 def get_rays(H, W, focal, c2w):
-    i, j = torch.meshgrid(torch.linspace(0, W-1, W), torch.linspace(0, H-1, H))  # pytorch's meshgrid has indexing='ij'
+    i, j = torch.meshgrid(torch.linspace(0, W-1, W), torch.linspace(0, H-1, H))
     i = i.t()
     j = j.t()
     x = (i-W*.5)/focal
@@ -158,20 +160,13 @@ def get_rays(H, W, focal, c2w):
     dirs = torch.stack([x, y, z], -1)
     rays_d = torch.sum(dirs[..., np.newaxis, :] * c2w[:3,:3], -1)
     rays_o = c2w[:3,-1].expand(rays_d.shape)
-
-    # [修正2] 已移除 debug 程式碼:
-    # rays_d_cpu = rays_d.detach().cpu()   ← 每次呼叫都做 GPU→CPU 複製!
-    # calculate_ray_angle(...)              ← 計算但從不使用
-    # center_ray, left_ray, right_ray      ← 計算但從不使用
     
     return rays_o, rays_d
 
-def ndc_rays(H, W, focal, near, rays_o, rays_d):   #把射線原點移到near平面
-    # Shift ray origins to near plane
+def ndc_rays(H, W, focal, near, rays_o, rays_d):
     t = -(near + rays_o[...,2]) / rays_d[...,2]
     rays_o = rays_o + t[...,None] * rays_d
     
-    # Projection
     o0 = -1./(W/(2.*focal)) * rays_o[...,0] / rays_o[...,2]
     o1 = -1./(H/(2.*focal)) * rays_o[...,1] / rays_o[...,2]
     o2 = 1. + 2. * near / rays_o[...,2]
@@ -187,25 +182,16 @@ def ndc_rays(H, W, focal, near, rays_o, rays_d):   #把射線原點移到near平
 
 
 def get_rays_ortho(H, W, c2w, size_h, size_w):
-    """Similar structure to 'get_rays' in submodules/nerf_pytorch/run_nerf_helpers.py"""
-    # # Rotate ray directions from camera frame to the world frame
-    rays_d = -c2w[:3, 2].view(1, 1, 3).expand(W, H, -1)  # direction to center in world coordinates 到世界座標中心的方向
+    rays_d = -c2w[:3, 2].view(1, 1, 3).expand(W, H, -1)
 
     i, j = torch.meshgrid(torch.linspace(0, W - 1, W),
-                          torch.linspace(0, H - 1, H))  # pytorch's meshgrid has indexing='ij'
+                          torch.linspace(0, H - 1, H))
     i = i.t()
     j = j.t()
 
-    # Translation from center for origins 從原點中心平移
     rays_o = torch.stack([(i - W * .5), -(j - H * .5), torch.zeros_like(i)], -1)
-
-    # Normalize to [-size_h/2, -size_w/2]
     rays_o = rays_o * torch.tensor([size_w / W, size_h / H, 1]).view(1, 1, 3)
-
-    # Rotate origins to the world frame 將原點旋轉到世界座標系
-    rays_o = torch.sum(rays_o[..., None, :] * c2w[:3, :3], -1)  # dot product, equals to: [c2w.dot(dir) for dir in dirs]
-
-    # Translate origins to the world frame 將原點平移到世界座標系
+    rays_o = torch.sum(rays_o[..., None, :] * c2w[:3, :3], -1)
     rays_o = rays_o + c2w[:3, -1].view(1, 1, 3)
 
     return rays_o, rays_d
@@ -213,20 +199,17 @@ def get_rays_ortho(H, W, c2w, size_h, size_w):
 
 # Hierarchical sampling (section 5.2)
 def sample_pdf(bins, weights, N_samples, det=False, pytest=False):
-    # Get pdf
-    weights = weights + 1e-5 # prevent nans
+    weights = weights + 1e-5
     pdf = weights / torch.sum(weights, -1, keepdim=True)
     cdf = torch.cumsum(pdf, -1)
-    cdf = torch.cat([torch.zeros_like(cdf[...,:1]), cdf], -1)  # (batch, len(bins))
+    cdf = torch.cat([torch.zeros_like(cdf[...,:1]), cdf], -1)
 
-    # Take uniform samples
     if det:
         u = torch.linspace(0., 1., steps=N_samples)
         u = u.expand(list(cdf.shape[:-1]) + [N_samples])
     else:
         u = torch.rand(list(cdf.shape[:-1]) + [N_samples])
 
-    # Pytest, overwrite u with numpy's fixed random numbers
     if pytest:
         np.random.seed(0)
         new_shape = list(cdf.shape[:-1]) + [N_samples]
@@ -237,15 +220,12 @@ def sample_pdf(bins, weights, N_samples, det=False, pytest=False):
             u = np.random.rand(*new_shape)
         u = torch.Tensor(u)
 
-    # Invert CDF
     u = u.contiguous()
     inds = torch.searchsorted(cdf, u, side='right')
     below = torch.max(torch.zeros_like(inds-1), inds-1)
     above = torch.min((cdf.shape[-1]-1) * torch.ones_like(inds), inds)
-    inds_g = torch.stack([below, above], -1)  # (batch, N_samples, 2)
+    inds_g = torch.stack([below, above], -1)
 
-    # cdf_g = tf.gather(cdf, inds_g, axis=-1, batch_dims=len(inds_g.shape)-2)
-    # bins_g = tf.gather(bins, inds_g, axis=-1, batch_dims=len(inds_g.shape)-2)
     matched_shape = [inds_g.shape[0], inds_g.shape[1], cdf.shape[-1]]
     cdf_g = torch.gather(cdf.unsqueeze(1).expand(matched_shape), 2, inds_g)
     bins_g = torch.gather(bins.unsqueeze(1).expand(matched_shape), 2, inds_g)
