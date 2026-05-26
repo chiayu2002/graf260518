@@ -632,6 +632,14 @@ def main():
 
                         gloss = gloss + lambda_interp * g_interp_loss
 
+            hs_bneck = shared_cond_proj.encode(hidden_state)
+            hs_bneck_n = F.normalize(hs_bneck, dim=-1)
+            sim_bneck = hs_bneck_n @ hs_bneck_n.T
+            hs_n = F.normalize(hidden_state.detach(), dim=-1)
+            sim_target = hs_n @ hs_n.T
+            bneck_div_loss = F.mse_loss(sim_bneck, sim_target)
+            gloss = gloss + 0.1 * bneck_div_loss
+
             if use_scaler:
                 scaler.scale(gloss).backward()
                 scaler.step(g_optimizer)

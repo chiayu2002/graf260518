@@ -1,4 +1,4 @@
-expname: column20260525_twostage_v2_revttur_lowrecon_lazyregSRskip_drift_interp_feature_changegru
+expname: column20260525_twostage_lowrecon_lazyregSRskip_drift_interp_feature_changegru_gloss
 data:
   datadir: [data/RS307_n, data/RS330_n, data/RS615_n]
   extractor_path: /Data/home/vicky/graf260518_im64/HystereticGRU/2026-05-24_16-19-37/Opensees Based damage Patterns Generation/s3mcwmow/checkpoints/best.ckpt
@@ -97,7 +97,7 @@ reconstruction:
 wandb:
   project: graf260108
   entity: vicky20020808
-  name: column20260525_twostage_v2_revttur_lowrecon_lazyregSRskip_drift_interp_feature_changegru
+  name: column20260525_twostage_lowrecon_lazyregSRskip_drift_interp_feature_changegru_gloss
 interpolation:
   enabled: true
   n_samples: 2
