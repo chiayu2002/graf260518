@@ -1,10 +1,10 @@
-expname: column20260525_twostage_lowrecon_lazyregSRskip_drift_interp_feature_changegru_gloss
+expname: column20260608_twostage_film_damage_damage_mod
 data:
   datadir: [data/RS307_n, data/RS330_n, data/RS615_n]
   extractor_path: /Data/home/vicky/graf260518_im64/HystereticGRU/2026-05-24_16-19-37/Opensees Based damage Patterns Generation/s3mcwmow/checkpoints/best.ckpt
   far: 4.5
   fov: 20
-  imsize: 256  
+  imsize: 256
   near: 1.5
   orthographic: False
   use_default_rays: False
@@ -14,7 +14,7 @@ data:
   umin: 0.
   vmax: 0.5
   vmin: 0.
-  v: 0.5, 0.4, 0.3, 0.2 
+  v: 0.5, 0.4, 0.3, 0.2
 discriminator:
   hflip: false
   ndf: 64
@@ -36,7 +36,7 @@ nerf:
   netwidth_fine: 256
   num_classes: 7
 ray_sampler:
-  N_samples: 4096          # 64×64 = 4096
+  N_samples: 4096
   max_scale: 1.0
   min_scale: 0.25
   scale_anneal: 0.01
@@ -47,13 +47,10 @@ training:
   equalize_lr: false
   fid_every: 10000
   gan_type: standard
-  # ========================================================
-  # [修正] 反向 TTUR：G 學快、D 學慢，解決 D 太強問題
-  # ========================================================
   lr_g: 0.0003
   lr_d: 0.0001
   lr_anneal: 0.5
-  lr_anneal_every: 150000,220000,2800000
+  lr_anneal_every: 200000,300000,400000
   model_average_beta: 0.999
   model_average_reinit: false
   model_file: model.pt
@@ -63,11 +60,7 @@ training:
   outdir: ./results
   print_every: 10
   reg_param: 10.0
-  # ========================================================
-  # [修正] aux/mat loss 權重分開控制
-  # ========================================================
-  label_param: 0.5         # aux_loss (hidden_state 預測) 權重
-  mat_param: 0.1           # [新增] mat_loss (材質 label 預測) 權重
+  label_param: 0.1        # 降權：FiLM 已結構性保留 hs 信號，aux 只需弱約束
   restart_every: -1
   sample_every: 5000
   save_best: fid
@@ -75,31 +68,42 @@ training:
   take_model_average: true
   use_amp: true
   amp_dtype: bfloat16
-  # ========================================================
-  # [兩階段設定]
-  # ========================================================
-  phase2_start_iter: 100000
-  lambda_d_high: 1.0
-  lambda_recon_sr: 1.0
+  # Phase 2 settings
+  phase2_start_iter: 150000
+  lambda_d_high: 0.5
+  lambda_recon_sr: 0.1
+  phase2_warmup_steps: 20000
 z_dist:
   dim: 256
   type: gauss
-ccsr: 
+ccsr:
   enabled: false
   num_views: 8
   scale_factor: 1
-# ========================================================
-# [修正] recon loss 大幅降低，避免壓過對抗信號
-# ========================================================
-reconstruction:
-  enabled: true
-  lambda_recon: 0.15       # 從 0.5 降到 0.05
+# reconstruction 已移除：與隨機 z 生成矛盾，造成輸出模糊
 wandb:
   project: graf260108
   entity: vicky20020808
-  name: column20260525_twostage_lowrecon_lazyregSRskip_drift_interp_feature_changegru_gloss
+  name: column20260608_twostage_film_damage_damage_mod
+# ========================================================
+# Interpolation: 256-dim FiLM embedding space
+# ========================================================
 interpolation:
   enabled: true
-  n_samples: 2
+  n_samples: 4
   lambda: 0.5
   start_iter: 5000
+# ========================================================
+# Damage Consistency Loss
+# core_ε (dim5) + cover_ε (dim6) 越大 → 生成圖像應越暗
+# ========================================================
+damage_consistency:
+  enabled: true
+  lambda: 0.3
+  start_iter: 5000
+  # threshold: 0.10       # mat_feat 破壞差異需超過此值才施加約束
+random_mat_aug:
+  enabled: true
+  lambda: 0.3
+  start_iter: 5000
+  n_samples: 4

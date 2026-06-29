@@ -1,52 +1,51 @@
+"""
+NeRF helpers — FiLM DualProjection 版本
+========================================
+conditioning 維度：256（FiLM out_dim）
+pts_linears 輸入：pos_enc(63) + z_feat(256) + conditioning(256) = 575
+"""
+
+import os
+import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from functools import partial
-from condition_bottleneck import ConditionBottleneck
-from mat_feat_proj import MaterialFeatureProjector
+
+# 確保同目錄的 dual_projection 可以被找到
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from dual_projection import DualProjection
+
+relu = partial(F.relu, inplace=True)
 
 
-
-# Misc
-relu = partial(F.relu, inplace=True)            # saves a lot of memory
-
-
-# Positional encoding (section 5.1)
 class Embedder:
     def __init__(self, **kwargs):
         self.kwargs = kwargs
         self.create_embedding_fn()
-        
+
     def create_embedding_fn(self):
         embed_fns = []
         d = self.kwargs['input_dims']
         out_dim = 0
         if self.kwargs['include_input']:
-            embed_fns.append(lambda x : x)
+            embed_fns.append(lambda x: x)
             out_dim += d
-            
         max_freq = self.kwargs['max_freq_log2']
-        N_freqs = self.kwargs['num_freqs']
-        
+        N_freqs  = self.kwargs['num_freqs']
         if self.kwargs['log_sampling']:
-            freq_bands = 2.**torch.linspace(0., max_freq, steps=N_freqs)
+            freq_bands = 2. ** torch.linspace(0., max_freq, steps=N_freqs)
         else:
             freq_bands = torch.linspace(2.**0., 2.**max_freq, steps=N_freqs)
-            
         for freq in freq_bands:
             for p_fn in self.kwargs['periodic_fns']:
-                embed_fns.append(lambda x, p_fn=p_fn, freq=freq : p_fn(x * freq))
+                embed_fns.append(lambda x, p_fn=p_fn, freq=freq: p_fn(x * freq))
                 out_dim += d
-                    
         self.embed_fns = embed_fns
-        self.out_dim = out_dim
-        
+        self.out_dim   = out_dim
+
     def embed(self, inputs):
-        # ========================================================
-        # [AMP safe] 高頻 sin/cos 在 fp16 下會失精,強制 fp32
-        # 對 bfloat16 也適用 — 保守起見統一走 fp32
-        # ========================================================
         with torch.cuda.amp.autocast(enabled=False):
             inputs = inputs.float()
             return torch.cat([fn(inputs) for fn in self.embed_fns], -1)
@@ -55,76 +54,74 @@ class Embedder:
 def get_embedder(multires, i=0):
     if i == -1:
         return nn.Identity(), 3
-    
     embed_kwargs = {
-                'include_input' : True,
-                'input_dims' : 3,
-                'max_freq_log2' : multires-1,
-                'num_freqs' : multires,
-                'log_sampling' : True,
-                'periodic_fns' : [torch.sin, torch.cos],
+        'include_input'  : True,
+        'input_dims'     : 3,
+        'max_freq_log2'  : multires - 1,
+        'num_freqs'      : multires,
+        'log_sampling'   : True,
+        'periodic_fns'   : [torch.sin, torch.cos],
     }
-    
     embedder_obj = Embedder(**embed_kwargs)
-    embed = lambda x, eo=embedder_obj : eo.embed(x)
+    embed = lambda x, eo=embedder_obj: eo.embed(x)
     return embed, embedder_obj.out_dim
 
 
-# Model
 class NeRF(nn.Module):
     def __init__(self, D=8, W=256, input_ch=3, input_ch_views=3,
-                 output_ch=4, skips=[4], numclasses=4, use_viewdirs=False,
-                 mat_proj_dim=64, **kwargs):
-        """
-        numclasses: 投影後的 material feature 維度 (原本是 raw mat_feat 維度).
-                    現在由 mat_feat_proj 投影, 預設 = mat_proj_dim = 64.
-        mat_proj_dim: MaterialFeatureProjector 的輸出維度.
-        """
+                 output_ch=4, skips=[4], use_viewdirs=False, **kwargs):
         super(NeRF, self).__init__()
-        self.D = D
-        self.W = W
-        self.input_ch = input_ch
+        self.D              = D
+        self.W              = W
+        self.input_ch       = input_ch       # pos_enc(63) + z_feat(256) = 319
         self.input_ch_views = input_ch_views
-        self.skips = skips
-        self.use_viewdirs = use_viewdirs
-        self.numclasses = numclasses
+        self.skips          = skips
+        self.use_viewdirs   = use_viewdirs
 
-        # [MAT_PROJ] numclasses 現在代表投影後的維度 (64), 不是原始的 7
-        self.pts_linears = nn.ModuleList(
-            [nn.Linear(input_ch + W + numclasses, W)] +
-            [nn.Linear(W, W) if i not in self.skips
-             else nn.Linear(W + input_ch + W + numclasses, W) for i in range(D-1)]
+        # FiLM DualProjection：hs(1024→256) modulated by mat(7→γ/β[256]) → 256
+        # out_dim = 256，與 W 相同
+        self.condition_feature = DualProjection(
+            hs_dim=1024, hs_out=256,
+            mat_dim=7,   mat_out=256,
         )
-        self.views_linears = nn.ModuleList([nn.Linear(input_ch_views + W, W//2)])
 
-        # 共享給 D 用 — 1024 → W (=256)
-        self.condition_feature = ConditionBottleneck(1024, W, bottleneck_dim=16)
+        # pts_linears 輸入維度：
+        #   input_ch     = pos_enc(63) + z_feat(256) = 319
+        #   conditioning = 256  (FiLM out_dim)
+        #   → first layer input = 319 + 256 = 575
+        cond_dim = self.condition_feature.out_dim  # 256
 
-        # [MAT_PROJ] Material feature projection: 7 → mat_proj_dim (64)
-        self.mat_feat_proj = MaterialFeatureProjector(mat_dim=7, proj_dim=mat_proj_dim)
+        self.pts_linears = nn.ModuleList(
+            [nn.Linear(input_ch + cond_dim, W)] +
+            [nn.Linear(W, W) if i not in self.skips
+             else nn.Linear(W + input_ch + cond_dim, W)
+             for i in range(D - 1)]
+        )
+        self.views_linears = nn.ModuleList(
+            [nn.Linear(input_ch_views + W, W // 2)]
+        )
 
         if use_viewdirs:
             self.feature_linear = nn.Linear(W, W)
-            self.alpha_linear = nn.Linear(W, 1)
-            self.rgb_linear = nn.Linear(W//2, 3)
+            self.alpha_linear   = nn.Linear(W, 1)
+            self.rgb_linear     = nn.Linear(W // 2, 3)
         else:
-            self.output_linear = nn.Linear(W, output_ch)
+            self.output_linear  = nn.Linear(W, output_ch)
 
-    def forward(self, x, hidden_state):
+    def forward(self, x, conditioning):
         """
-        x: [N_pts, input_ch + W]  (positional encoding + projected features)
-        hidden_state: [N_pts, W + numclasses]  (projected hs + projected mat_feat)
+        x            : [N_pts, input_ch + input_ch_views]
+        conditioning : [N_pts, 256]  已由 render() 層展開
         """
         input_pts, input_views = torch.split(
-            x, [self.input_ch, self.input_ch_views], dim=-1
-        )
-        hidden_state = hidden_state.to(input_pts.device)
+            x, [self.input_ch, self.input_ch_views], dim=-1)
+        conditioning = conditioning.to(input_pts.device)
 
-        # 直接使用已投影的 hidden_state (包含 mat_feat projection)
-        feature_embedding = hidden_state
-
+        # input_pts = [pos_enc(63) | z_feat(256)]
         input_o, input_shape = torch.split(input_pts, [63, 256], dim=-1)
-        conditioned_input = torch.cat([input_o, input_shape, feature_embedding], dim=-1)
+        conditioned_input = torch.cat([input_o, input_shape, conditioning], dim=-1)
+        # conditioned_input: [N_pts, 63+256+256] = [N_pts, 575]
+
         h = conditioned_input
         for i, l in enumerate(self.pts_linears):
             h = self.pts_linears[i](h)
@@ -133,106 +130,84 @@ class NeRF(nn.Module):
                 h = torch.cat([h, conditioned_input], -1)
 
         if self.use_viewdirs:
-            alpha = self.alpha_linear(h)
+            alpha   = self.alpha_linear(h)
             feature = self.feature_linear(h)
             h = torch.cat([feature, input_views], -1)
             for i, l in enumerate(self.views_linears):
                 h = self.views_linears[i](h)
                 h = relu(h)
-            rgb = self.rgb_linear(h)
+            rgb     = self.rgb_linear(h)
             outputs = torch.cat([rgb, alpha], -1)
         else:
             outputs = self.output_linear(h)
-        return outputs   
+
+        return outputs
 
 
-# ========================================================
-# [修正2] 移除 get_rays 中的 debug 程式碼
-# ========================================================
+# ── Ray helpers ──────────────────────────────────────────────────────────────
+
 def get_rays(H, W, focal, c2w):
     i, j = torch.meshgrid(torch.linspace(0, W-1, W), torch.linspace(0, H-1, H))
-    i = i.t()
-    j = j.t()
-    x = (i-W*.5)/focal
-    y = -(j-H*.5)/focal
+    i = i.t(); j = j.t()
+    x = (i - W*.5) / focal
+    y = -(j - H*.5) / focal
     z = -torch.ones_like(i)
-
-    dirs = torch.stack([x, y, z], -1)
-    rays_d = torch.sum(dirs[..., np.newaxis, :] * c2w[:3,:3], -1)
-    rays_o = c2w[:3,-1].expand(rays_d.shape)
-    
+    dirs   = torch.stack([x, y, z], -1)
+    rays_d = torch.sum(dirs[..., np.newaxis, :] * c2w[:3, :3], -1)
+    rays_o = c2w[:3, -1].expand(rays_d.shape)
     return rays_o, rays_d
 
-def ndc_rays(H, W, focal, near, rays_o, rays_d):
-    t = -(near + rays_o[...,2]) / rays_d[...,2]
-    rays_o = rays_o + t[...,None] * rays_d
-    
-    o0 = -1./(W/(2.*focal)) * rays_o[...,0] / rays_o[...,2]
-    o1 = -1./(H/(2.*focal)) * rays_o[...,1] / rays_o[...,2]
-    o2 = 1. + 2. * near / rays_o[...,2]
 
-    d0 = -1./(W/(2.*focal)) * (rays_d[...,0]/rays_d[...,2] - rays_o[...,0]/rays_o[...,2])
-    d1 = -1./(H/(2.*focal)) * (rays_d[...,1]/rays_d[...,2] - rays_o[...,1]/rays_o[...,2])
-    d2 = -2. * near / rays_o[...,2]
-    
-    rays_o = torch.stack([o0,o1,o2], -1)
-    rays_d = torch.stack([d0,d1,d2], -1)
-    
+def ndc_rays(H, W, focal, near, rays_o, rays_d):
+    t      = -(near + rays_o[..., 2]) / rays_d[..., 2]
+    rays_o = rays_o + t[..., None] * rays_d
+    o0 = -1./(W/(2.*focal)) * rays_o[..., 0] / rays_o[..., 2]
+    o1 = -1./(H/(2.*focal)) * rays_o[..., 1] / rays_o[..., 2]
+    o2 =  1. + 2.*near / rays_o[..., 2]
+    d0 = -1./(W/(2.*focal)) * (rays_d[..., 0]/rays_d[..., 2] - rays_o[..., 0]/rays_o[..., 2])
+    d1 = -1./(H/(2.*focal)) * (rays_d[..., 1]/rays_d[..., 2] - rays_o[..., 1]/rays_o[..., 2])
+    d2 = -2.*near / rays_o[..., 2]
+    rays_o = torch.stack([o0, o1, o2], -1)
+    rays_d = torch.stack([d0, d1, d2], -1)
     return rays_o, rays_d
 
 
 def get_rays_ortho(H, W, c2w, size_h, size_w):
     rays_d = -c2w[:3, 2].view(1, 1, 3).expand(W, H, -1)
-
-    i, j = torch.meshgrid(torch.linspace(0, W - 1, W),
-                          torch.linspace(0, H - 1, H))
-    i = i.t()
-    j = j.t()
-
-    rays_o = torch.stack([(i - W * .5), -(j - H * .5), torch.zeros_like(i)], -1)
-    rays_o = rays_o * torch.tensor([size_w / W, size_h / H, 1]).view(1, 1, 3)
+    i, j   = torch.meshgrid(torch.linspace(0, W-1, W), torch.linspace(0, H-1, H))
+    i = i.t(); j = j.t()
+    rays_o = torch.stack([(i-W*.5), -(j-H*.5), torch.zeros_like(i)], -1)
+    rays_o = rays_o * torch.tensor([size_w/W, size_h/H, 1]).view(1, 1, 3)
     rays_o = torch.sum(rays_o[..., None, :] * c2w[:3, :3], -1)
     rays_o = rays_o + c2w[:3, -1].view(1, 1, 3)
-
     return rays_o, rays_d
 
 
-# Hierarchical sampling (section 5.2)
 def sample_pdf(bins, weights, N_samples, det=False, pytest=False):
     weights = weights + 1e-5
-    pdf = weights / torch.sum(weights, -1, keepdim=True)
-    cdf = torch.cumsum(pdf, -1)
-    cdf = torch.cat([torch.zeros_like(cdf[...,:1]), cdf], -1)
-
+    pdf     = weights / torch.sum(weights, -1, keepdim=True)
+    cdf     = torch.cumsum(pdf, -1)
+    cdf     = torch.cat([torch.zeros_like(cdf[..., :1]), cdf], -1)
     if det:
-        u = torch.linspace(0., 1., steps=N_samples)
-        u = u.expand(list(cdf.shape[:-1]) + [N_samples])
+        u = torch.linspace(0., 1., steps=N_samples).expand(
+            list(cdf.shape[:-1]) + [N_samples])
     else:
         u = torch.rand(list(cdf.shape[:-1]) + [N_samples])
-
     if pytest:
         np.random.seed(0)
         new_shape = list(cdf.shape[:-1]) + [N_samples]
-        if det:
-            u = np.linspace(0., 1., N_samples)
-            u = np.broadcast_to(u, new_shape)
-        else:
-            u = np.random.rand(*new_shape)
+        u = np.linspace(0., 1., N_samples) if det else np.random.rand(*new_shape)
         u = torch.Tensor(u)
-
-    u = u.contiguous()
+    u    = u.contiguous()
     inds = torch.searchsorted(cdf, u, side='right')
     below = torch.max(torch.zeros_like(inds-1), inds-1)
-    above = torch.min((cdf.shape[-1]-1) * torch.ones_like(inds), inds)
+    above = torch.min((cdf.shape[-1]-1)*torch.ones_like(inds), inds)
     inds_g = torch.stack([below, above], -1)
-
     matched_shape = [inds_g.shape[0], inds_g.shape[1], cdf.shape[-1]]
-    cdf_g = torch.gather(cdf.unsqueeze(1).expand(matched_shape), 2, inds_g)
+    cdf_g  = torch.gather(cdf.unsqueeze(1).expand(matched_shape),  2, inds_g)
     bins_g = torch.gather(bins.unsqueeze(1).expand(matched_shape), 2, inds_g)
-
-    denom = (cdf_g[...,1]-cdf_g[...,0])
-    denom = torch.where(denom<1e-5, torch.ones_like(denom), denom)
-    t = (u-cdf_g[...,0])/denom
-    samples = bins_g[...,0] + t * (bins_g[...,1]-bins_g[...,0])
-
+    denom  = (cdf_g[..., 1] - cdf_g[..., 0])
+    denom  = torch.where(denom < 1e-5, torch.ones_like(denom), denom)
+    t      = (u - cdf_g[..., 0]) / denom
+    samples = bins_g[..., 0] + t * (bins_g[..., 1] - bins_g[..., 0])
     return samples

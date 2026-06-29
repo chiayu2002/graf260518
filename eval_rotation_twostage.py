@@ -37,22 +37,21 @@ import imageio
 SPECIMENS = {
     'RS307': {
         'vec':      [1, 0, 1, 0, 0, 0, 1],
-        'mat_feat': [0, 0.1906, 0.8342, 0.1, 1, 0.0589, 0.1081],
+        'mat_feat': [0.000000, 0.156717, 0.918975, 0.339361, 0.498170, 0.310937, 0.360617],
     },
     'RS330': {
         'vec':      [1, 0, 0, 0, 1, 1, 0],
-        'mat_feat': [0.0088, 1, 1, 1, 0, 1, 1],
+        'mat_feat': [0.008831, 1.000000, 1.000000, 1.000000, 0.000000, 1.000000, 1.000000],
     },
     'RS615': {
         'vec':      [0, 1, 0, 1, 0, 1, 0],
-        'mat_feat': [1, 0, 0, 0, 0.5826, 0, 0],
+        'mat_feat': [1.000000, 0.000000, 0.000000, 0.000000, 1.000000, 0.000000, 0.000000],
     },
     'RS315': {
         'vec':      [1, 0, 0, 1, 0, 1, 0],
-        'mat_feat': [0.0062, 0.4365, 0.602, 0.6261, 0.0064, 0.6284, 0.653],
+        'mat_feat': [0.006158, 0.411209, 0.538894, 0.725360, 0.017321, 0.727661, 0.751007],
     },
 }
-
 
 def make_label(spec_name, height_idx=0, angle_idx=0, N=1, device='cuda'):
     """Build a 16-dim label tensor for a specimen.
@@ -360,7 +359,7 @@ def main():
                 generator.sample_select_pose(i / N_frames, 0.5)
                 for i in range(N_frames)])
 
-            outpath = os.path.join(eval_dir, f'{spec_name}_rotation/')
+            outpath = os.path.join(eval_dir, f'{spec_name}_rotation_v05/')
             os.makedirs(outpath, exist_ok=True)
             make_video_with_hs(evaluator, outpath, z, label, hs, poses,
                                sr_network=sr_network, as_gif=args.as_gif)
