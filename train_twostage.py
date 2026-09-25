@@ -3,8 +3,11 @@ Two-Stage Training: NeRF 64×64 + SR 256×256
 FiLM DualProjection: hs(1024→256) modulated by mat(7→γ/β[256]) → [256]
 Shared conditioning for G (NeRF) and D.
 Interpolation in the 256-dim FiLM embedding space.
-Physical Consistency Loss: 多維度物理約束，讓任意 mat_feat 對應合理外觀。
-Random Mat Feat Augmentation: 在 mat_feat 凸包內隨機取樣，擴展訓練覆蓋範圍。
+Damage Consistency Loss (版本 A):
+  單一約束：整體暗色比例排序
+  expected_damage = displacement*0.20 + corner_rebar_ε*0.15 + core_σ*0.15
+                  + core_ε*0.25 + cover_ε*0.25
+  RS307=0.268, RS615=0.350, RS315=0.494, RS330=0.752
 """
 import argparse, os, importlib, json, glob, time, random, sys
 import numpy as np
@@ -63,8 +66,8 @@ def initialize_training(config, device):
 
     train_dataset, hwfr = get_data(config, extractor, extractor_args)
     if config['data']['orthographic']:
-        hw_ortho    = (config['data']['far'] - config['data']['near'],) * 2
-        hwfr[2]     = hw_ortho
+        hw_ortho = (config['data']['far'] - config['data']['near'],) * 2
+        hwfr[2]  = hw_ortho
     config['data']['hwfr'] = hwfr
 
     train_loader = torch.utils.data.DataLoader(
@@ -88,10 +91,10 @@ def initialize_training(config, device):
 
 class RayCache:
     def __init__(self, generator, v_list, focal_64):
-        self._cache    = {}
+        self._cache     = {}
         self._generator = generator
-        self._v_list   = v_list
-        self._focal_64 = focal_64
+        self._v_list    = v_list
+        self._focal_64  = focal_64
         self._n_heights = len(v_list)
 
     def get_rays(self, angle_idx, height_idx):
@@ -163,118 +166,62 @@ class InterpCache:
         return i_emb, i_label, i_hs, i_mat
 
 
-# ── Physical Consistency Loss ────────────────────────────────────────────────
+# ── Damage Consistency Loss（版本 A：單一約束）───────────────────────────────
 
-def compute_damage_proxy(mat_feat):
+def compute_damage_consistency_loss(nerf_img, mat_feat, margin=0.05, damage_thresh=0.15):
     """
-    計算破壞程度代理值。
-    各 specimen 對應值：RS307=0.268, RS615=0.350, RS315=0.494, RS330=0.752
-    排序符合真實視覺破壞程度：RS307 < RS615 < RS315 < RS330
-    """
-    return (
-        mat_feat[:, 0] * 0.20 +   # displacement（RS615 彎曲型破壞關鍵）
-        mat_feat[:, 3] * 0.15 +   # corner_rebar_ε（鋼筋屈服程度）
-        mat_feat[:, 4] * 0.15 +   # core_concrete_σ（核心混凝土應力）
-        mat_feat[:, 5] * 0.25 +   # core_concrete_ε（核心應變）
-        mat_feat[:, 6] * 0.25     # cover_concrete_ε（保護層應變）
-    )
+    版本 A：單一約束，整體暗色比例排序。
 
+    破壞程度代理（加權）：
+      displacement   (dim0) * 0.20  ← RS615 彎曲型破壞關鍵
+      corner_rebar_ε (dim3) * 0.15  ← 鋼筋屈服程度
+      core_concrete_σ(dim4) * 0.15  ← 核心混凝土應力
+      core_concrete_ε(dim5) * 0.25  ← 核心應變
+      cover_concrete_ε(dim6)* 0.25  ← 保護層應變
 
-def compute_physical_consistency_loss(nerf_img, mat_feat, margin=0.05):
-    """
-    多維度物理一致性損失：從 mat_feat 的物理量直接約束生成圖像的視覺特徵。
-    讓任意輸入的 mat_feat 組合都能生成對應物理意義的破壞外觀。
+    各 specimen proxy 值：
+      RS307 = 0.268
+      RS615 = 0.350  ← 正確反映彎曲型破壞
+      RS315 = 0.494
+      RS330 = 0.752
+    排序：RS307 < RS615 < RS315 < RS330
 
-    nerf_img : [B, 3, 64/256, 64/256]，值域 [-1, 1]
-    mat_feat : [B, 7]，值域 [0, 1]
-
-    三個物理約束：
-      1. 整體暗色比例：damage_proxy 越大 → 圖像越暗（整體破壞程度）
-      2. 下半部暗色集中度：displacement 越大 → 下半部比上半部更暗（彎曲型破壞）
-      3. 極暗區域比例：core_ε + cover_ε 越大 → 更多極暗像素（鋼筋外露）
+    nerf_img      : [B, 3, H, W]，值域 [-1, 1]
+    mat_feat      : [B, 7]，值域 [0, 1]
+    margin        : ranking loss margin
+    damage_thresh : proxy 差異需超過此值才施加約束
     """
     bs = nerf_img.size(0)
     if bs < 2:
         return torch.tensor(0., device=nerf_img.device)
 
-    img_01     = (nerf_img + 1.0) / 2.0          # [B, 3, H, W]，值域 [0,1]
-    brightness = img_01.mean(dim=1)               # [B, H, W]
-    H          = brightness.shape[1]
+    img_01     = (nerf_img + 1.0) / 2.0
+    brightness = img_01.mean(dim=1)
+    dark_ratio = (1.0 - brightness).mean(dim=[1, 2])  # [B]
 
-    # ── 視覺特徵 1：整體暗色比例 ────────────────────────────────
-    dark_ratio    = (1.0 - brightness).mean(dim=[1, 2])   # [B]
-    damage_proxy  = compute_damage_proxy(mat_feat)         # [B]
-
-    # ── 視覺特徵 2：下半部 vs 上半部暗色比例 ─────────────────────
-    # 橋柱破壞從底部開始，displacement 越大代表頂端位移越大，
-    # 整體破壞更嚴重，下半部暗色應相對更多
-    lower_dark  = (1.0 - brightness[:, H//2:, :]).mean(dim=[1, 2])  # [B]
-    upper_dark  = (1.0 - brightness[:, :H//2, :]).mean(dim=[1, 2])  # [B]
-    lower_ratio = lower_dark / (upper_dark + 1e-6)                   # [B]
-    displacement = mat_feat[:, 0]                                     # [B]
-
-    # ── 視覺特徵 3：極暗區域比例（鋼筋外露、嚴重剝落）──────────
-    very_dark    = (brightness < 0.3).float().mean(dim=[1, 2])        # [B]
-    severe_proxy = (mat_feat[:, 5] + mat_feat[:, 6]) / 2.0           # [B]
+    expected_damage = (
+        mat_feat[:, 0] * 0.20 +   # displacement
+        mat_feat[:, 3] * 0.15 +   # corner_rebar_ε
+        mat_feat[:, 4] * 0.15 +   # core_concrete_σ
+        mat_feat[:, 5] * 0.25 +   # core_concrete_ε
+        mat_feat[:, 6] * 0.25     # cover_concrete_ε
+    )  # [B]
 
     loss  = torch.tensor(0., device=nerf_img.device)
     count = 0
 
     for i in range(bs):
         for j in range(i + 1, bs):
-
-            # 約束 1：整體破壞程度排序（threshold=0.10，覆蓋更多 pair）
-            dmg_diff = damage_proxy[i] - damage_proxy[j]
-            if dmg_diff.abs().item() > 0.10:
-                dark_diff = dark_ratio[i] - dark_ratio[j]
-                loss  = loss + F.relu(-dmg_diff.sign() * dark_diff + margin)
-                count += 1
-
-            # 約束 2：下半部破壞集中度（displacement 大 → lower_ratio 大）
-            disp_diff = displacement[i] - displacement[j]
-            if disp_diff.abs().item() > 0.15:
-                lr_diff = lower_ratio[i] - lower_ratio[j]
-                loss  = loss + F.relu(
-                    -disp_diff.sign() * lr_diff + margin) * 0.5
-                count += 1
-
-            # 約束 3：極暗區域排序（core_ε + cover_ε 大 → 更多極暗）
-            severe_diff = severe_proxy[i] - severe_proxy[j]
-            if severe_diff.abs().item() > 0.15:
-                vd_diff = very_dark[i] - very_dark[j]
-                loss  = loss + F.relu(
-                    -severe_diff.sign() * vd_diff + margin) * 0.5
-                count += 1
+            damage_diff = expected_damage[i] - expected_damage[j]
+            if damage_diff.abs().item() < damage_thresh:
+                continue
+            dark_diff = dark_ratio[i] - dark_ratio[j]
+            loss  = loss + F.relu(-damage_diff.sign() * dark_diff + margin)
+            count += 1
 
     if count > 0:
         loss = loss / count
     return loss
-
-
-# ── Random Mat Feat Sampling ──────────────────────────────────────────────────
-
-def sample_random_mat_feat(batch_size, specimen_specs, device):
-    """
-    在 training specimens 的 mat_feat 凸包內隨機取樣新的 mat_feat 組合。
-    使用 Dirichlet 分布，確保取樣點落在凸包內（所有 specimen 的加權平均）。
-    讓 G 被訓練在整個 mat_feat 空間而不只是 3 個離散的訓練點上。
-    """
-    # 只用 training specimens（有 real image 的）
-    train_specs = {k: v for k, v in specimen_specs.items()
-                   if k in ['RS307', 'RS330', 'RS615']}
-    spec_names  = list(train_specs.keys())
-    mf_tensors  = torch.stack([
-        torch.tensor(train_specs[sn][1], dtype=torch.float32, device=device)
-        for sn in spec_names
-    ])  # [3, 7]
-
-    # Dirichlet(1,1,1)：在凸包內均勻取樣
-    weights = torch.distributions.Dirichlet(
-        torch.ones(len(spec_names), device=device)
-    ).sample((batch_size,))              # [B, 3]
-
-    random_mat = weights @ mf_tensors   # [B, 7]
-    return random_mat
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -301,43 +248,33 @@ def main():
     save_every_s    = config['training']['save_every']
     device          = torch.device("cuda:0")
 
-    use_amp        = config['training'].get('use_amp', False)
-    amp_dtype_str  = config['training'].get('amp_dtype', 'bfloat16')
-    amp_dtype      = torch.bfloat16 if amp_dtype_str == 'bfloat16' else torch.float16
-    use_scaler     = use_amp and amp_dtype == torch.float16
-    scaler         = torch.cuda.amp.GradScaler() if use_scaler else None
+    use_amp       = config['training'].get('use_amp', False)
+    amp_dtype_str = config['training'].get('amp_dtype', 'bfloat16')
+    amp_dtype     = torch.bfloat16 if amp_dtype_str == 'bfloat16' else torch.float16
+    use_scaler    = use_amp and amp_dtype == torch.float16
+    scaler        = torch.cuda.amp.GradScaler() if use_scaler else None
 
     phase2_start    = config['training'].get('phase2_start_iter', 150000)
     lambda_d_high   = config['training'].get('lambda_d_high', 0.5)
     lambda_recon_sr = config['training'].get('lambda_recon_sr', 0.5)
     phase2_warmup   = config['training'].get('phase2_warmup_steps', 20000)
 
-    # recon64 已移除（與隨機生成 z 目標矛盾，造成輸出模糊化）
-
     interp_config = config.get('interpolation', {})
     use_interp    = interp_config.get('enabled', True)
     n_interp      = interp_config.get('n_samples', 4)
     lambda_interp = interp_config.get('lambda', 1.0)
-    interp_start  = interp_config.get('start_iter', 2000)
+    interp_start  = interp_config.get('start_iter', 5000)
 
-    # Physical Consistency Loss 設定（取代舊的 damage_consistency）
-    damage_config   = config.get('damage_consistency', {})
-    use_damage      = damage_config.get('enabled', True)
-    lambda_damage   = damage_config.get('lambda', 0.3)
-    damage_start    = damage_config.get('start_iter', 5000)
-
-    # Random Mat Feat Augmentation 設定
-    randmat_config  = config.get('random_mat_aug', {})
-    use_randmat     = randmat_config.get('enabled', True)
-    lambda_randmat  = randmat_config.get('lambda', 0.3)
-    randmat_start   = randmat_config.get('start_iter', 5000)
-    n_randmat       = randmat_config.get('n_samples', 4)
+    damage_config = config.get('damage_consistency', {})
+    use_damage    = damage_config.get('enabled', True)
+    lambda_damage = damage_config.get('lambda', 0.3)
+    damage_start  = damage_config.get('start_iter', 5000)
+    damage_thresh = damage_config.get('threshold', 0.15)
 
     print(f"[TwoStage] Phase1: 0~{phase2_start}  Phase2: {phase2_start}+  warmup={phase2_warmup}")
-    print(f"[Weights] aux={aux_loss_weight}(weakened), reg={reg_param}")
-    print(f"[INTERP] enabled={use_interp}, n={n_interp}, λ={lambda_interp}, start={interp_start}")
-    print(f"[PHYSICAL] enabled={use_damage}, λ={lambda_damage}, start={damage_start}")
-    print(f"[RANDMAT]  enabled={use_randmat}, λ={lambda_randmat}, start={randmat_start}, n={n_randmat}")
+    print(f"[Weights]  aux={aux_loss_weight}, reg={reg_param}")
+    print(f"[INTERP]   enabled={use_interp}, n={n_interp}, λ={lambda_interp}, start={interp_start}")
+    print(f"[DAMAGE]   enabled={use_damage}, λ={lambda_damage}, start={damage_start}, thresh={damage_thresh}")
 
     out_dir, checkpoint_dir = setup_directories(config)
     save_config(os.path.join(out_dir, 'config.yaml'), config)
@@ -351,7 +288,7 @@ def main():
     train_loader, train_dataset, generator, discriminator = initialize_training(config, device)
 
     nerf_model       = generator.render_kwargs_train['network_fn']
-    shared_cond_proj = nerf_model.condition_feature   # FiLM DualProjection
+    shared_cond_proj = nerf_model.condition_feature
 
     sr_network = SRNetwork(ch=64, n_rb=6).to(device)
     d_high     = DiscriminatorHigh(
@@ -406,7 +343,7 @@ def main():
         'RS315': ([1,0,0,1,0,1,0], [0.006158,0.411209,0.538894,0.725360,0.017321,0.727661,0.751007]),
     }
 
-    # ── 初始 similarity 分析 ──────────────────────────────────────
+    # ── Similarity 分析 ───────────────────────────────────────────────────────
     print("-" * 60)
     hs_keys = list(cached_hs.keys())
     for i, k1 in enumerate(hs_keys):
@@ -421,6 +358,13 @@ def main():
                 e2  = shared_cond_proj.encode(hs2.unsqueeze(0), mf2)
                 emb_cos = F.cosine_similarity(e1, e2).item()
             print(f"  {k1} vs {k2}: HS_L2={diff:.4f}  HS_cos={cos_sim:.4f}  Emb256_cos={emb_cos:.4f}")
+
+    print("\n[Damage Proxy 確認]")
+    for sn, (vec, mf) in specimen_specs.items():
+        mf_t  = torch.tensor(mf, device=device).unsqueeze(0)
+        proxy = (mf_t[:,0]*0.20 + mf_t[:,3]*0.15 + mf_t[:,4]*0.15
+                 + mf_t[:,5]*0.25 + mf_t[:,6]*0.25).item()
+        print(f"  {sn}: {proxy:.3f}")
     print("-" * 60 + "\n")
 
     v_list    = [float(x.strip()) for x in config['data']['v'].split(",")]
@@ -465,9 +409,9 @@ def main():
         )
         print(f"[INTERP] Cached {interp_cache.n} specimens: {interp_cache.names}")
 
-    zero         = torch.tensor(0., device=device)
-    last_reg_lo  = 0.0
-    last_reg_hi  = 0.0
+    zero        = torch.tensor(0., device=device)
+    last_reg_lo = 0.0
+    last_reg_hi = 0.0
 
     # ================================================================
     # 訓練迴圈
@@ -481,17 +425,15 @@ def main():
                 print(f"\n{'='*60}\n[Phase 2] iter {it}: SR + D_high active\n{'='*60}")
                 phase2_flag = True
 
-            # InterpCache 每 1000 steps 更新一次（embedding space 已改變）
             if use_interp and it >= interp_start and it % 1000 == 0:
                 interp_cache = InterpCache(cached_hs, specimen_specs, shared_cond_proj, device)
 
-            x_real        = x_real.to(device, non_blocking=True)
-            label         = label.to(device,  non_blocking=True)
-            hidden_state  = hidden_state.to(device, non_blocking=True)
-            mat_feat      = label[:, 7:14].float()   # [B, 7]
-            x_real_64 = F.interpolate(x_real, size=(64, 64),
-                                          mode='bilinear', align_corners=True)
-            # x_real_64 仍用於 D_low 的輸入（real image downscale）
+            x_real       = x_real.to(device, non_blocking=True)
+            label        = label.to(device,  non_blocking=True)
+            hidden_state = hidden_state.to(device, non_blocking=True)
+            mat_feat     = label[:, 7:14].float()
+            x_real_64    = F.interpolate(x_real, size=(64, 64),
+                                         mode='bilinear', align_corners=True)
 
             generator.ray_sampler.iterations = it
             do_r1 = (it % 16 == 0)
@@ -508,8 +450,8 @@ def main():
             with amp_ctx():
                 d_real_lo, aux_real = discriminator(
                     x_real_d, hidden_state, mat_feat, return_aux=True)
-                dloss_real_lo  = compute_loss(d_real_lo, 1)
-                aux_loss_real  = F.mse_loss(aux_real, hidden_state)
+                dloss_real_lo = compute_loss(d_real_lo, 1)
+                aux_loss_real = F.mse_loss(aux_real, hidden_state)
 
             if do_r1:
                 dloss_real_lo.backward(retain_graph=True)
@@ -522,7 +464,7 @@ def main():
             (aux_loss_weight * aux_loss_real).backward()
 
             with torch.no_grad(), amp_ctx():
-                rays_f     = ray_cache.batch_rays(label, batch_size)
+                rays_f       = ray_cache.batch_rays(label, batch_size)
                 nerf_flat, _ = generator(z, label, hidden_state, rays=rays_f)
 
             nerf_img_64 = nerf_flat_to_img(nerf_flat, batch_size)
@@ -577,9 +519,9 @@ def main():
 
             z = zdist.sample((batch_size,))
             with amp_ctx():
-                rays_g      = ray_cache.batch_rays(label, batch_size)
-                nerf_g, _   = generator(z, label, hidden_state, rays=rays_g)
-                nerf_g_img  = nerf_flat_to_img(nerf_g, batch_size)
+                rays_g     = ray_cache.batch_rays(label, batch_size)
+                nerf_g, _  = generator(z, label, hidden_state, rays=rays_g)
+                nerf_g_img = nerf_flat_to_img(nerf_g, batch_size)
 
                 dfl_g, aux_f = discriminator(
                     nerf_g_img, hidden_state, mat_feat, return_aux=True)
@@ -595,24 +537,26 @@ def main():
                     g_adv_hi   = compute_loss(dfh_g, 1)
                     sr_rec     = recon_loss_fn(sr_g, x_real)
 
-                # recon64 已移除：與隨機 z 生成矛盾，造成輸出模糊
                 gloss = g_adv_lo + aux_loss_weight * g_aux
                 if in_p2:
                     gloss = (gloss
                              + lambda_d_high   * p2_ramp * g_adv_hi
                              + lambda_recon_sr * p2_ramp * sr_rec)
 
-                # ── Physical Consistency Loss（training specimens）────
+                # ── Damage Consistency Loss（版本 A）─────────────────
                 g_damage_loss = zero
                 if use_damage and it >= damage_start:
-                    g_damage_loss = compute_physical_consistency_loss(
-                        nerf_g_img, mat_feat, margin=0.05)
+                    g_damage_loss = compute_damage_consistency_loss(
+                        nerf_g_img, mat_feat,
+                        margin=0.05, damage_thresh=damage_thresh,
+                    )
                     gloss = gloss + lambda_damage * g_damage_loss
 
-                    # Phase 2：SR 圖像也施加 physical loss
                     if in_p2:
-                        sr_damage = compute_physical_consistency_loss(
-                            sr_g, mat_feat, margin=0.05)
+                        sr_damage = compute_damage_consistency_loss(
+                            sr_g, mat_feat,
+                            margin=0.05, damage_thresh=damage_thresh,
+                        )
                         gloss = gloss + lambda_damage * p2_ramp * sr_damage
 
                 # ── Interpolation Loss ────────────────────────────────
@@ -641,54 +585,6 @@ def main():
 
                         gloss = gloss + lambda_interp * g_interp_loss
 
-                # ── Random Mat Feat Augmentation ──────────────────────
-                # 在 training specimens 的 mat_feat 凸包內隨機取樣新的參數組合，
-                # 對這些「從未見過的參數」施加 physical consistency loss，
-                # 讓 G 學到整個 mat_feat 空間的連續對應關係。
-                g_randmat_loss = zero
-                if use_randmat and it >= randmat_start:
-                    rand_mat = sample_random_mat_feat(
-                        n_randmat, specimen_specs, device)  # [n_randmat, 7]
-
-                    # hs 用最近 specimen（RS330）代理
-                    rand_hs  = cached_hs['RS330'].unsqueeze(0).expand(
-                        n_randmat, -1)                      # [n_randmat, 1024]
-
-                    # 計算 embedding
-                    rand_emb = shared_cond_proj.encode(rand_hs, rand_mat)
-
-                    # vec 用 RS330 的結構特徵向量
-                    vec_330  = torch.tensor(
-                        specimen_specs['RS330'][0],
-                        dtype=torch.float32, device=device)
-                    rand_label = torch.cat([
-                        vec_330.unsqueeze(0).expand(n_randmat, -1),
-                        rand_mat,
-                        torch.zeros(n_randmat, 1, device=device),
-                        torch.randint(0, 360, (n_randmat, 1),
-                                      device=device, dtype=torch.float32),
-                    ], dim=-1)                              # [n_randmat, 16]
-
-                    shared_cond_proj.set_override(rand_emb)
-                    z_rand     = zdist.sample((n_randmat,))
-                    rays_rand  = ray_cache.batch_rays(rand_label, n_randmat)
-                    nerf_rand, _ = generator(
-                        z_rand, rand_label, rand_hs, rays=rays_rand)
-                    nerf_rand_img = nerf_flat_to_img(nerf_rand, n_randmat)
-                    shared_cond_proj.clear_override()
-
-                    # 對隨機取樣的 mat_feat 施加 physical consistency loss
-                    g_randmat_loss = compute_physical_consistency_loss(
-                        nerf_rand_img, rand_mat, margin=0.05)
-                    gloss = gloss + lambda_randmat * g_randmat_loss
-
-                    # Phase 2：SR 也施加
-                    if in_p2:
-                        sr_rand = sr_network(nerf_rand_img)
-                        sr_randmat_loss = compute_physical_consistency_loss(
-                            sr_rand, rand_mat, margin=0.05)
-                        gloss = gloss + lambda_randmat * p2_ramp * sr_randmat_loss
-
             gloss.backward()
             g_optimizer.step()
             if in_p2:
@@ -704,7 +600,6 @@ def main():
                     "loss/g_label"      : g_aux.item(),
                     "loss/g_damage"     : g_damage_loss.item(),
                     "loss/g_interp"     : g_interp_loss.item(),
-                    "loss/g_randmat"    : g_randmat_loss.item(),
                     "loss/d_low"        : (dloss_real_lo.item() + dloss_fake_lo.item()
                                            + last_reg_lo
                                            + aux_loss_weight * aux_loss_real.item()),
@@ -736,11 +631,10 @@ def main():
                             emb_dict[sn] = shared_cond_proj.encode(
                                 cached_hs[sn].unsqueeze(0), mf_t)
                         else:
-                            # RS315 推論用插值 embedding
-                            hs315_proxy = cached_hs.get('RS330', None)
-                            if hs315_proxy is not None:
+                            hs_proxy = cached_hs.get('RS330', None)
+                            if hs_proxy is not None:
                                 emb_dict[sn] = shared_cond_proj.encode(
-                                    hs315_proxy.unsqueeze(0), mf_t)
+                                    hs_proxy.unsqueeze(0), mf_t)
 
                     pairs = [
                         ('RS307', 'RS315'), ('RS307', 'RS330'), ('RS307', 'RS615'),

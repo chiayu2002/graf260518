@@ -30,7 +30,7 @@ class ImageDataset(VisionDataset):
         self.extractor = extractor
         self.extractor_args = extractor_args
         self.result_dir = result_dir
-        self.exp_list = ['RS307', 'RS315', 'RS330','RS615'] #,'RS315'
+        self.exp_list = ['RS307', 'RS315', 'RS330','RS615','c1s','c1t','c2s','c2t','CTR1'] #,'RS315'
         self.hysteresis = {}
         self.hidden_state = self.get_hidden_state(extractor, self.exp_list, result_dir=result_dir)
 
@@ -41,6 +41,11 @@ class ImageDataset(VisionDataset):
             "RS315_n": [0.006158,0.411209,0.538894,0.725360,0.017321,0.727661,0.7510072],
             "RS330_n": [0.008831,1.000000,1.000000,1.000000,0.000000,1.000000,1.000000],
             "RS615_n": [1.000000,0.000000,0.000000,0.000000,1.000000,0.000000,0.000000],
+            'c1s': [0.287,0.915,2.387,4.325,0.22,1.084,1.264],
+            'c1t': [0.784,0.402,1.843,2.928,0.418,0.339,0.461],
+            'c2s':[0.287,1.013,3.210,4.418,0.253,1.115,1.299],
+            'c2t':[0.784,0.469,2.743,2.997,0.462,0.355,0.480],
+            'CTR1' : [0.0387,0.7344,-0.8443,0.8834,-0.0399,0.9952,1.3825]
         }
 
         self.height_map = {
@@ -140,19 +145,19 @@ class ImageDataset(VisionDataset):
     def get_hidden_state(self, extractor, exp_list, result_dir):
         hidden_state = {}
         
-        test_ds = HystereticDataset(root="/Data/home/vicky/graf260108_im64/Data/Hysteresis", specified=exp_list, **vars(self.extractor_args))
+        test_ds = HystereticDataset(root="/Data/home/vicky/graf260518_im64/Data/Hysteresis", specified=exp_list, **vars(self.extractor_args))
         test_dataloader = DataLoader(test_ds, batch_size=1, shuffle=False, num_workers=0, collate_fn=test_ds.collate_fn)
         device = extractor.device
         
         with torch.no_grad():
             for j, batch in enumerate(tqdm(test_dataloader)):
-                simulated_loop, test_force, _, maximun_simulated_force, exp = batch
+                simulated_loop, _, maximun_simulated_force, exp = batch
                 simulated_loop = simulated_loop.to(device)
                 output, _ = extractor.L(simulated_loop)
                 hidden_state[exp[0]] = output[0, -1, :].cpu().squeeze()
                 
                 predicted_force = extractor.P(output)
-                self.draw(predicted_force, simulated_loop, test_force, maximun_simulated_force, exp[0], result_dir)
+                # self.draw(predicted_force, simulated_loop, test_force, maximun_simulated_force, exp[0], result_dir)
         
         return hidden_state
     
@@ -222,20 +227,20 @@ class HystereticDataset(Dataset):
             self.hysteresis_loop[exp] = {"simulate": 0, "exp": 0, "info": 0}
             
         for exp in self.exp_list:
-            df_test = pd.read_csv(os.path.join(self.path, "Experiment", f"{exp}.csv"))
+            # df_test = pd.read_csv(os.path.join(self.path, "Experiment", f"{exp}.csv"))
             df_simulate = pd.read_csv(os.path.join(self.path, "Simulate", f"{exp}.csv"))
             info = self.info[self.info["id"]==exp].iloc[:, 1:].values
             simulation_values = df_simulate.loc[:, ["Drift(%)", "Force(kN)"]].values
-            test_values = df_test.loc[:, ["Force(kN)"]].values
+            # test_values = df_test.loc[:, ["Force(kN)"]].values
             
             self.hysteresis_loop[exp]["simulate"] = simulation_values
-            self.hysteresis_loop[exp]["exp"] = test_values
+            # self.hysteresis_loop[exp]["exp"] = test_values
             self.hysteresis_loop[exp]["info"] = info
 
     def __getitem__(self, index):
         exp = self.exp_list[index]
         simulated_loop = torch.FloatTensor(self.hysteresis_loop[exp]["simulate"])
-        test_force = torch.FloatTensor(self.hysteresis_loop[exp]["exp"])
+        # test_force = torch.FloatTensor(self.hysteresis_loop[exp]["exp"])
         info = torch.FloatTensor(self.hysteresis_loop[exp]["info"])
         if self.simulate and self.scale:
             maximun_simulated_force = simulated_loop[:, 1].max()
@@ -248,22 +253,22 @@ class HystereticDataset(Dataset):
         else:
             input = torch.cat([info.repeat(simulated_loop.shape[0], 1), simulated_loop[:, 0:1]], dim=1)
             
-        test_force[:, 0] = test_force[:, 0] / maximun_simulated_force
+        # test_force[:, 0] = test_force[:, 0] / maximun_simulated_force
         original_length = simulated_loop.shape[0]
         
-        return input, test_force, original_length, maximun_simulated_force, exp
+        return input, original_length, maximun_simulated_force, exp
     
     def __len__(self):
         return len(self.hysteresis_loop)
 
     def collate_fn(self, batch):
-        simulated_loop, test_force, original_length, maximun_simulated_force, exp = zip(*batch)
+        simulated_loop, original_length, maximun_simulated_force, exp = zip(*batch)
         simulated_loop = torch.nn.utils.rnn.pad_sequence(simulated_loop, batch_first=True, padding_value=0)
-        test_force = torch.nn.utils.rnn.pad_sequence(test_force, batch_first=True, padding_value=0)
+        # test_force = torch.nn.utils.rnn.pad_sequence(test_force, batch_first=True, padding_value=0)
         original_length = torch.tensor(original_length)
         maximun_simulated_force = torch.stack(maximun_simulated_force)
         exp = list(exp)
-        return simulated_loop, test_force, original_length, maximun_simulated_force, exp
+        return simulated_loop, original_length, maximun_simulated_force, exp
     
 class PatternLoopDataset(Dataset):
     
@@ -319,13 +324,13 @@ class PatternLoopDataset(Dataset):
         
         with torch.no_grad():
             for j, batch in enumerate(tqdm(test_dataloader)):
-                simulated_loop, test_force, _, maximun_simulated_force, exp = batch
+                simulated_loop, _, maximun_simulated_force, exp = batch
                 simulated_loop = simulated_loop.to(device)
                 output, _ = extractor.L(simulated_loop)
                 hidden_state[exp[0]] = output.cpu().squeeze()
                 
                 predicted_force = extractor.P(output)
-                self.draw(predicted_force, simulated_loop, test_force, maximun_simulated_force, exp[0], result_dir)
+                # self.draw(predicted_force, simulated_loop, test_force, maximun_simulated_force, exp[0], result_dir)
         
         return hidden_state
     

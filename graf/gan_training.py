@@ -44,15 +44,24 @@ class Trainer(TrainerBase):
 
 
 class Evaluator(EvaluatorBase):
-    def __init__(self, eval_fid_kid, *args, **kwargs):
+    def __init__(self, eval_fid_kid, *args, n_samples=20000, n_samples_fake=1000, **kwargs):
+        """
+        n_samples / n_samples_fake:
+          FIDEvaluator 拿來決定「real 特徵要收集幾張」跟「fake 特徵要生成幾張」
+          的目標張數。原本寫死 20000 / 1000，量測全量結果沒問題，但在
+          --quick 這種只想快速確認 pipeline 沒壞的情境下太慢（real dataset
+          張數不足時會被夾到資料集實際大小，仍然要生成同等數量的 fake 圖）。
+          現在開放成建構參數，呼叫端（eval_twostage.py）可以依 --quick /
+          --all 傳入不同的值，預設值維持跟原本行為一致（20000 / 1000）。
+        """
         super(Evaluator, self).__init__(*args, **kwargs)
         if eval_fid_kid:
             self.inception_eval = FIDEvaluator(
               device=self.device,
               batch_size=self.batch_size,
               resize=True,
-              n_samples=20000,
-              n_samples_fake=1000,
+              n_samples=n_samples,
+              n_samples_fake=n_samples_fake,
             )
 
     def get_rays(self, pose):
